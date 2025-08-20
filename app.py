@@ -6,170 +6,168 @@ import tempfile
 import zipfile
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from PIL import Image, ExifTags
+from pptx.dml.color import RGBColor
+from PIL import Image
 
-# --------- Helper: Ensure PPT-compatible format ----------
-def ensure_supported_format(image_path):
-    supported_formats = ["BMP", "GIF", "JPEG", "PNG", "TIFF", "WMF"]
+# ---------- Utility functions ----------
+
+def load_image(path):
+    """Load image with Pillow and convert to OpenCV format."""
     try:
-        img = Image.open(image_path)
-        fmt = img.format.upper() if img.format else None
-
-        if fmt not in supported_formats:
-            temp_dir = tempfile.gettempdir()
-            new_path = os.path.join(temp_dir, os.path.basename(image_path) + ".png")
-            img.convert("RGB").save(new_path, "PNG")
-            return new_path
-        return image_path
+        img = Image.open(path).convert("RGB")
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     except Exception as e:
-        print(f"Error converting {image_path}: {e}")
+        st.warning(f"Could not load {path}: {e}")
         return None
 
-# --------- Helper: Auto rotate if EXIF orientation exists ----------
-def auto_rotate(image_path):
-    try:
-        img = Image.open(image_path)
-        for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation] == 'Orientation':
-                break
-        exif = dict(img._getexif().items())
+def is_tilted(image):
+    """Detect tilt using Hough transform."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLines(edges, 1, np.pi/180, 200)
+    if lines is None:
+        return False, 0
+    angles = []
+    for rho, theta in lines[:,0]:
+        angle = (theta * 180 / np.pi) - 90
+        if -45 < angle < 45:
+            angles.append(angle)
+    if len(angles) == 0:
+        return False, 0
+    median_angle = np.median(angles)
+    return abs(median_angle) > 5, median_angle
 
-        if exif.get(orientation) == 3:
-            img = img.rotate(180, expand=True)
-        elif exif.get(orientation) == 6:
-            img = img.rotate(270, expand=True)
-        elif exif.get(orientation) == 8:
-            img = img.rotate(90, expand=True)
+def rotate_image(image, angle):
+    """Rotate image to correct tilt."""
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, M, (w, h))
 
-        temp_path = os.path.join(tempfile.gettempdir(), "rotated_" + os.path.basename(image_path))
-        img.save(temp_path)
-        return temp_path
-    except Exception:
-        return image_path
+def detect_blur_regions(image):
+    """Detect multiple blurry regions."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_var = cv2.convertScaleAbs(lap)
+    _, mask = cv2.threshold(lap_var, 15, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return contours
 
-# --------- Edge Case Detection ----------
-def detect_edge_cases(image_path):
+def detect_dark_bright_regions(image):
+    """Detect dark/bright regions using adaptive threshold."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark_mask = cv2.adaptiveThreshold(gray, 255,
+                                      cv2.ADAPTIVE_THRESH_MEAN_C,
+                                      cv2.THRESH_BINARY_INV, 15, 10)
+    bright_mask = cv2.adaptiveThreshold(gray, 255,
+                                        cv2.ADAPTIVE_THRESH_MEAN_C,
+                                        cv2.THRESH_BINARY, 15, -10)
+    mask = cv2.bitwise_or(dark_mask, bright_mask)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return contours
+
+def analyze_image(image):
+    """Analyze image and return processed image + reasons."""
+    processed = image.copy()
     reasons = []
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return ["Unreadable image"]
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Tilt correction
+    tilted, angle = is_tilted(image)
+    if tilted:
+        image = rotate_image(image, angle)
+        processed = image.copy()
+        reasons.append(f"Tilted image corrected by {angle:.2f} degrees")
 
-        # Blur check
-        blur_val = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur_val < 100:
-            reasons.append(f"Blurry image detected (Blur score = {blur_val:.2f}, threshold=100)")
+    # Blurry regions
+    blur_contours = detect_blur_regions(image)
+    if blur_contours:
+        for c in blur_contours:
+            if cv2.contourArea(c) > 500:  # ignore tiny noise
+                x, y, w, h = cv2.boundingRect(c)
+                cv2.rectangle(processed, (x, y), (x+w, y+h), (0, 0, 255), 2)
+        reasons.append("Blurry regions detected")
 
-        # Brightness check
-        brightness = np.mean(gray)
-        if brightness < 50:
-            reasons.append(f"Low brightness (Brightness = {brightness:.2f}, threshold=50)")
+    # Dark/Bright regions
+    light_contours = detect_dark_bright_regions(image)
+    if light_contours:
+        for c in light_contours:
+            if cv2.contourArea(c) > 500:
+                x, y, w, h = cv2.boundingRect(c)
+                cv2.rectangle(processed, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        reasons.append("Dark or overexposed regions detected")
 
-        # Contrast check
-        contrast = gray.std()
-        if contrast < 20:
-            reasons.append(f"Low contrast (Contrast = {contrast:.2f}, threshold=20)")
+    if not reasons:
+        reasons.append("No significant edge case detected")
 
-        # Tilt detection using Hough lines
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, 200)
-        if lines is not None:
-            angles = []
-            for rho, theta in lines[:, 0]:
-                angle = (theta * 180 / np.pi) - 90
-                if -45 < angle < 45:
-                    angles.append(angle)
-            if angles:
-                avg_angle = np.mean(angles)
-                if abs(avg_angle) > 5:  # tilted
-                    reasons.append(f"Tilted image auto-corrected (rotation={avg_angle:.2f}°)")
-    except Exception as e:
-        reasons.append(f"Error processing: {e}")
+    return processed, reasons
 
-    return reasons
-
-# --------- PPT Generator ----------
-def create_ppt(edge_cases, output_path="Edge_Cases_Presentation.pptx"):
+def create_ppt(results, output_path):
     prs = Presentation()
     blank_slide_layout = prs.slide_layouts[6]  # empty slide
 
-    # Cover slide
-    cover_slide = prs.slides.add_slide(prs.slide_layouts[5])
-    title = cover_slide.shapes.title
-    subtitle = cover_slide.placeholders[1]
-    title.text = "📊 Product Image Edge Case Report"
-    subtitle.text = f"Total Edge Cases: {len(edge_cases)}"
-
-    for case in edge_cases:
-        image_path, reasons = case
-        if not reasons:
-            continue
-
+    for orig_path, orig_img, proc_img, reasons in results:
         slide = prs.slides.add_slide(blank_slide_layout)
 
-        # Title
-        title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(1))
-        tf = title_box.text_frame
-        tf.text = "Edge Case Detected"
-        tf.paragraphs[0].font.size = Pt(24)
-        tf.paragraphs[0].font.bold = True
+        # Save temp images for insertion
+        orig_temp = orig_path + "_orig_tmp.jpg"
+        proc_temp = orig_path + "_proc_tmp.jpg"
+        cv2.imwrite(orig_temp, orig_img)
+        cv2.imwrite(proc_temp, proc_img)
 
-        # Image
-        img_path = ensure_supported_format(image_path)
-        if img_path:
-            slide.shapes.add_picture(img_path, Inches(1), Inches(1.5), width=Inches(6))
+        # Insert Original (left)
+        left = Inches(0.5)
+        top = Inches(1)
+        slide.shapes.add_picture(orig_temp, left, top, width=Inches(4.5))
 
-        # Reason text
-        text_box = slide.shapes.add_textbox(Inches(0.5), Inches(5.5), Inches(9), Inches(2))
-        tf = text_box.text_frame
+        # Insert Processed (right)
+        left = Inches(5.5)
+        slide.shapes.add_picture(proc_temp, left, top, width=Inches(4.5))
+
+        # Add reason text
+        txBox = slide.shapes.add_textbox(Inches(0.5), Inches(6.5), Inches(9), Inches(1))
+        tf = txBox.text_frame
         for reason in reasons:
             p = tf.add_paragraph()
             p.text = reason
             p.font.size = Pt(14)
+            p.font.color.rgb = RGBColor(255, 0, 0)
+
+        os.remove(orig_temp)
+        os.remove(proc_temp)
 
     prs.save(output_path)
-    return output_path
 
-# --------- Streamlit UI ----------
-st.title("🛠️ Product Image Edge Case Analyzer")
+# ---------- Streamlit App ----------
 
-uploaded_files = st.file_uploader(
-    "Upload multiple images or a ZIP file",
-    type=["jpg", "jpeg", "png", "bmp", "tiff", "gif", "mpo", "zip"],
-    accept_multiple_files=True
-)
+st.title("Edge Case Detection and PPT Generator")
 
-if uploaded_files:
-    all_images = []
+uploaded_zip = st.file_uploader("Upload a ZIP containing images", type=["zip"])
 
-    # Handle uploads
-    for uploaded_file in uploaded_files:
-        temp_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+if uploaded_zip:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "uploaded.zip")
+        with open(zip_path, "wb") as f:
+            f.write(uploaded_zip.read())
 
-        if uploaded_file.name.lower().endswith(".zip"):
-            with zipfile.ZipFile(temp_path, "r") as zip_ref:
-                extract_dir = os.path.join(tempfile.gettempdir(), "unzipped")
-                zip_ref.extractall(extract_dir)
-                for root, _, files in os.walk(extract_dir):
-                    for file in files:
-                        all_images.append(os.path.join(root, file))
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(tmpdir)
+
+        results = []
+        for root, _, files in os.walk(tmpdir):
+            for file in files:
+                if file.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
+                    path = os.path.join(root, file)
+                    img = load_image(path)
+                    if img is None:
+                        continue
+                    processed, reasons = analyze_image(img)
+                    results.append((path, img, processed, reasons))
+
+        if results:
+            output_ppt = os.path.join(tmpdir, "edge_cases.pptx")
+            create_ppt(results, output_ppt)
+            st.success("PPT created successfully!")
+            with open(output_ppt, "rb") as f:
+                st.download_button("Download PPT", f, file_name="edge_cases.pptx")
         else:
-            all_images.append(temp_path)
-
-    edge_cases = []
-    for img_path in all_images:
-        rotated_path = auto_rotate(img_path)
-        reasons = detect_edge_cases(rotated_path)
-
-        if reasons:
-            st.image(rotated_path, caption=f"Edge Cases: {', '.join(reasons)}", use_container_width=True)
-            edge_cases.append((rotated_path, reasons))
-
-    if edge_cases:
-        ppt_path = create_ppt(edge_cases)
-        with open(ppt_path, "rb") as f:
-            st.download_button("📥 Download Edge Cases PPT", f, file_name="Edge_Cases_Presentation.pptx")
+            st.warning("No valid images found in the uploaded ZIP.")
