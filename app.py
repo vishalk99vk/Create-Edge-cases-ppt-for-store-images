@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import os
 import tempfile
+import zipfile
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from PIL import Image, ExifTags
@@ -94,6 +95,13 @@ def create_ppt(edge_cases, output_path="Edge_Cases_Presentation.pptx"):
     prs = Presentation()
     blank_slide_layout = prs.slide_layouts[6]  # empty slide
 
+    # Cover slide
+    cover_slide = prs.slides.add_slide(prs.slide_layouts[5])
+    title = cover_slide.shapes.title
+    subtitle = cover_slide.placeholders[1]
+    title.text = "📊 Product Image Edge Case Report"
+    subtitle.text = f"Total Edge Cases: {len(edge_cases)}"
+
     for case in edge_cases:
         image_path, reasons = case
         if not reasons:
@@ -101,24 +109,20 @@ def create_ppt(edge_cases, output_path="Edge_Cases_Presentation.pptx"):
 
         slide = prs.slides.add_slide(blank_slide_layout)
 
-        # Add title
+        # Title
         title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(1))
         tf = title_box.text_frame
         tf.text = "Edge Case Detected"
         tf.paragraphs[0].font.size = Pt(24)
         tf.paragraphs[0].font.bold = True
 
-        # Add image
+        # Image
         img_path = ensure_supported_format(image_path)
         if img_path:
             slide.shapes.add_picture(img_path, Inches(1), Inches(1.5), width=Inches(6))
 
-        # Add reason text
-        left = Inches(0.5)
-        top = Inches(5.5)
-        width = Inches(9)
-        height = Inches(2)
-        text_box = slide.shapes.add_textbox(left, top, width, height)
+        # Reason text
+        text_box = slide.shapes.add_textbox(Inches(0.5), Inches(5.5), Inches(9), Inches(2))
         tf = text_box.text_frame
         for reason in reasons:
             p = tf.add_paragraph()
@@ -131,20 +135,34 @@ def create_ppt(edge_cases, output_path="Edge_Cases_Presentation.pptx"):
 # --------- Streamlit UI ----------
 st.title("🛠️ Product Image Edge Case Analyzer")
 
-uploaded_files = st.file_uploader("Upload multiple images", type=["jpg", "jpeg", "png", "bmp", "tiff", "gif", "mpo"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload multiple images or a ZIP file",
+    type=["jpg", "jpeg", "png", "bmp", "tiff", "gif", "mpo", "zip"],
+    accept_multiple_files=True
+)
 
 if uploaded_files:
-    edge_cases = []
+    all_images = []
+
+    # Handle uploads
     for uploaded_file in uploaded_files:
-        # Save temp file
         temp_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        # Auto rotate before analysis
-        rotated_path = auto_rotate(temp_path)
+        if uploaded_file.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(temp_path, "r") as zip_ref:
+                extract_dir = os.path.join(tempfile.gettempdir(), "unzipped")
+                zip_ref.extractall(extract_dir)
+                for root, _, files in os.walk(extract_dir):
+                    for file in files:
+                        all_images.append(os.path.join(root, file))
+        else:
+            all_images.append(temp_path)
 
-        # Detect edge cases
+    edge_cases = []
+    for img_path in all_images:
+        rotated_path = auto_rotate(img_path)
         reasons = detect_edge_cases(rotated_path)
 
         if reasons:
