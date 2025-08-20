@@ -7,21 +7,22 @@ import zipfile
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 # ---------- Utility functions ----------
 
 def load_image(path):
-    """Load image with Pillow and convert to OpenCV format."""
+    """Load any image type with Pillow and convert to OpenCV format."""
     try:
         img = Image.open(path).convert("RGB")
         return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    except UnidentifiedImageError:
+        return None
     except Exception as e:
         st.warning(f"Could not load {path}: {e}")
         return None
 
 def is_tilted(image):
-    """Detect tilt using Hough transform."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     lines = cv2.HoughLines(edges, 1, np.pi/180, 200)
@@ -38,14 +39,12 @@ def is_tilted(image):
     return abs(median_angle) > 5, median_angle
 
 def rotate_image(image, angle):
-    """Rotate image to correct tilt."""
     (h, w) = image.shape[:2]
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
     return cv2.warpAffine(image, M, (w, h))
 
 def detect_blur_regions(image):
-    """Detect multiple blurry regions."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_var = cv2.convertScaleAbs(lap)
@@ -54,7 +53,6 @@ def detect_blur_regions(image):
     return contours
 
 def detect_dark_bright_regions(image):
-    """Detect dark/bright regions using adaptive threshold."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     dark_mask = cv2.adaptiveThreshold(gray, 255,
                                       cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -67,7 +65,6 @@ def detect_dark_bright_regions(image):
     return contours
 
 def analyze_image(image):
-    """Analyze image and return processed image + reasons."""
     processed = image.copy()
     reasons = []
 
@@ -82,7 +79,7 @@ def analyze_image(image):
     blur_contours = detect_blur_regions(image)
     if blur_contours:
         for c in blur_contours:
-            if cv2.contourArea(c) > 500:  # ignore tiny noise
+            if cv2.contourArea(c) > 500:
                 x, y, w, h = cv2.boundingRect(c)
                 cv2.rectangle(processed, (x, y), (x+w, y+h), (0, 0, 255), 2)
         reasons.append("Blurry regions detected")
@@ -103,27 +100,23 @@ def analyze_image(image):
 
 def create_ppt(results, output_path):
     prs = Presentation()
-    blank_slide_layout = prs.slide_layouts[6]  # empty slide
+    blank_slide_layout = prs.slide_layouts[6]
 
     for orig_path, orig_img, proc_img, reasons in results:
         slide = prs.slides.add_slide(blank_slide_layout)
 
-        # Save temp images for insertion
         orig_temp = orig_path + "_orig_tmp.jpg"
         proc_temp = orig_path + "_proc_tmp.jpg"
         cv2.imwrite(orig_temp, orig_img)
         cv2.imwrite(proc_temp, proc_img)
 
-        # Insert Original (left)
         left = Inches(0.5)
         top = Inches(1)
         slide.shapes.add_picture(orig_temp, left, top, width=Inches(4.5))
 
-        # Insert Processed (right)
         left = Inches(5.5)
         slide.shapes.add_picture(proc_temp, left, top, width=Inches(4.5))
 
-        # Add reason text
         txBox = slide.shapes.add_textbox(Inches(0.5), Inches(6.5), Inches(9), Inches(1))
         tf = txBox.text_frame
         for reason in reasons:
@@ -155,13 +148,12 @@ if uploaded_zip:
         results = []
         for root, _, files in os.walk(tmpdir):
             for file in files:
-                if file.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
-                    path = os.path.join(root, file)
-                    img = load_image(path)
-                    if img is None:
-                        continue
-                    processed, reasons = analyze_image(img)
-                    results.append((path, img, processed, reasons))
+                path = os.path.join(root, file)
+                img = load_image(path)
+                if img is None:
+                    continue
+                processed, reasons = analyze_image(img)
+                results.append((path, img, processed, reasons))
 
         if results:
             output_ppt = os.path.join(tmpdir, "edge_cases.pptx")
